@@ -18,10 +18,15 @@
 (define-constant ERR_INSUFFICIENT_APPROVALS (err u111))
 (define-constant ERR_APPROVAL_EXPIRED (err u112))
 (define-constant ERR_INVALID_APPROVER (err u113))
+(define-constant ERR_MAINTENANCE_NOT_FOUND (err u114))
+(define-constant ERR_INVALID_STATUS (err u115))
+(define-constant ERR_MAINTENANCE_COMPLETED (err u116))
+(define-constant ERR_INVALID_COST (err u117))
 
 (define-data-var next-property-id uint u1)
 (define-data-var next-lease-id uint u1)
 (define-data-var next-approval-id uint u1)
+(define-data-var next-maintenance-id uint u1)
 
 (define-map properties
   { property-id: uint }
@@ -88,6 +93,42 @@
 (define-map approval-votes
   { approval-id: uint, approver: principal }
   { has-voted: bool, vote-block: uint }
+)
+
+(define-map maintenance-requests
+  { maintenance-id: uint }
+  {
+    property-id: uint,
+    lease-id: uint,
+    requester: principal,
+    landlord: principal,
+    tenant: principal,
+    category: (string-ascii 20),
+    description: (string-ascii 500),
+    estimated-cost: uint,
+    actual-cost: uint,
+    responsible-party: (string-ascii 10),
+    status: (string-ascii 15),
+    created-at: uint,
+    approved-at: uint,
+    completed-at: uint,
+    cost-allocation: (string-ascii 15)
+  }
+)
+
+(define-map property-maintenance-history
+  { property-id: uint }
+  { maintenance-ids: (list 50 uint), total-maintenance-cost: uint }
+)
+
+(define-map lease-maintenance-adjustments
+  { lease-id: uint }
+  { 
+    total-tenant-costs: uint,
+    total-landlord-costs: uint,
+    rent-adjustments: uint,
+    price-adjustments: uint
+  }
 )
 
 (define-public (create-property (total-price uint) (monthly-rent uint) (lease-duration-months uint) (metadata (string-ascii 256)))
@@ -472,3 +513,227 @@
 (define-read-only (get-next-approval-id)
   (var-get next-approval-id)
 )
+
+(define-public (submit-maintenance-request (lease-id uint) (category (string-ascii 20)) (description (string-ascii 500)) (estimated-cost uint))
+  (let
+    (
+      (lease (unwrap! (map-get? leases { lease-id: lease-id }) ERR_LEASE_NOT_FOUND))
+      (maintenance-id (var-get next-maintenance-id))
+      (property-history (default-to { maintenance-ids: (list), total-maintenance-cost: u0 } 
+        (map-get? property-maintenance-history { property-id: (get property-id lease) })))
+    )
+    (asserts! (get is-active lease) ERR_LEASE_COMPLETED)
+    (asserts! (or (is-eq tx-sender (get tenant lease)) (is-eq tx-sender (get landlord lease))) ERR_UNAUTHORIZED)
+    (asserts! (> estimated-cost u0) ERR_INVALID_COST)
+    
+    (map-set maintenance-requests
+      { maintenance-id: maintenance-id }
+      {
+        property-id: (get property-id lease),
+        lease-id: lease-id,
+        requester: tx-sender,
+        landlord: (get landlord lease),
+        tenant: (get tenant lease),
+        category: category,
+        description: description,
+        estimated-cost: estimated-cost,
+        actual-cost: u0,
+        responsible-party: "pending",
+        status: "submitted",
+        created-at: stacks-block-height,
+        approved-at: u0,
+        completed-at: u0,
+        cost-allocation: "pending"
+      }
+    )
+    
+    (map-set property-maintenance-history
+      { property-id: (get property-id lease) }
+      { 
+        maintenance-ids: (unwrap! (as-max-len? (append (get maintenance-ids property-history) maintenance-id) u50) ERR_INVALID_AMOUNT),
+        total-maintenance-cost: (get total-maintenance-cost property-history)
+      }
+    )
+    
+    (var-set next-maintenance-id (+ maintenance-id u1))
+    (ok maintenance-id)
+  )
+)
+
+(define-public (approve-maintenance-request (maintenance-id uint) (responsible-party (string-ascii 10)) (cost-allocation (string-ascii 15)))
+  (let
+    (
+      (request (unwrap! (map-get? maintenance-requests { maintenance-id: maintenance-id }) ERR_MAINTENANCE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get landlord request)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status request) "submitted") ERR_INVALID_STATUS)
+    
+    (map-set maintenance-requests
+      { maintenance-id: maintenance-id }
+      (merge request {
+        responsible-party: responsible-party,
+        status: "approved",
+        approved-at: stacks-block-height,
+        cost-allocation: cost-allocation
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (complete-maintenance-request (maintenance-id uint) (actual-cost uint))
+  (let
+    (
+      (request (unwrap! (map-get? maintenance-requests { maintenance-id: maintenance-id }) ERR_MAINTENANCE_NOT_FOUND))
+      (lease-adjustments (default-to { total-tenant-costs: u0, total-landlord-costs: u0, rent-adjustments: u0, price-adjustments: u0 }
+        (map-get? lease-maintenance-adjustments { lease-id: (get lease-id request) })))
+      (property-history (unwrap! (map-get? property-maintenance-history { property-id: (get property-id request) }) ERR_PROPERTY_NOT_FOUND))
+    )
+    (asserts! (or (is-eq tx-sender (get landlord request)) (is-eq tx-sender (get tenant request))) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status request) "approved") ERR_INVALID_STATUS)
+    (asserts! (> actual-cost u0) ERR_INVALID_COST)
+    
+    (map-set maintenance-requests
+      { maintenance-id: maintenance-id }
+      (merge request {
+        actual-cost: actual-cost,
+        status: "completed",
+        completed-at: stacks-block-height
+      })
+    )
+    
+    (map-set property-maintenance-history
+      { property-id: (get property-id request) }
+      (merge property-history {
+        total-maintenance-cost: (+ (get total-maintenance-cost property-history) actual-cost)
+      })
+    )
+    
+    (let
+      (
+        (tenant-cost-increase (if (is-eq (get responsible-party request) "tenant") actual-cost u0))
+        (landlord-cost-increase (if (is-eq (get responsible-party request) "landlord") actual-cost u0))
+        (rent-adjustment (if (is-eq (get cost-allocation request) "rent-increase") actual-cost u0))
+        (price-adjustment (if (is-eq (get cost-allocation request) "price-increase") actual-cost u0))
+      )
+      (map-set lease-maintenance-adjustments
+        { lease-id: (get lease-id request) }
+        {
+          total-tenant-costs: (+ (get total-tenant-costs lease-adjustments) tenant-cost-increase),
+          total-landlord-costs: (+ (get total-landlord-costs lease-adjustments) landlord-cost-increase),
+          rent-adjustments: (+ (get rent-adjustments lease-adjustments) rent-adjustment),
+          price-adjustments: (+ (get price-adjustments lease-adjustments) price-adjustment)
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (reject-maintenance-request (maintenance-id uint) (reason (string-ascii 256)))
+  (let
+    (
+      (request (unwrap! (map-get? maintenance-requests { maintenance-id: maintenance-id }) ERR_MAINTENANCE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get landlord request)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status request) "submitted") ERR_INVALID_STATUS)
+    
+    (map-set maintenance-requests
+      { maintenance-id: maintenance-id }
+      (merge request {
+        status: "rejected",
+        approved-at: stacks-block-height
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (pay-maintenance-cost (maintenance-id uint))
+  (let
+    (
+      (request (unwrap! (map-get? maintenance-requests { maintenance-id: maintenance-id }) ERR_MAINTENANCE_NOT_FOUND))
+    )
+    (asserts! (is-eq (get status request) "completed") ERR_INVALID_STATUS)
+    (asserts! (> (get actual-cost request) u0) ERR_INVALID_COST)
+    
+    (if (is-eq (get responsible-party request) "tenant")
+      (begin
+        (asserts! (is-eq tx-sender (get tenant request)) ERR_UNAUTHORIZED)
+        (try! (stx-transfer? (get actual-cost request) tx-sender (get landlord request)))
+      )
+      (begin
+        (asserts! (is-eq tx-sender (get landlord request)) ERR_UNAUTHORIZED)
+        (try! (stx-transfer? (get actual-cost request) tx-sender (get tenant request)))
+      )
+    )
+    
+    (map-set maintenance-requests
+      { maintenance-id: maintenance-id }
+      (merge request { status: "paid" })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-maintenance-request (maintenance-id uint))
+  (map-get? maintenance-requests { maintenance-id: maintenance-id })
+)
+
+(define-read-only (get-property-maintenance-history (property-id uint))
+  (map-get? property-maintenance-history { property-id: property-id })
+)
+
+(define-read-only (get-lease-maintenance-adjustments (lease-id uint))
+  (map-get? lease-maintenance-adjustments { lease-id: lease-id })
+)
+
+(define-read-only (get-adjusted-lease-terms (lease-id uint))
+  (match (map-get? leases { lease-id: lease-id })
+    lease 
+      (match (map-get? lease-maintenance-adjustments { lease-id: lease-id })
+        adjustments (ok {
+          original-monthly-rent: (get monthly-rent lease),
+          original-total-price: (get total-price lease),
+          adjusted-monthly-rent: (+ (get monthly-rent lease) (get rent-adjustments adjustments)),
+          adjusted-total-price: (+ (get total-price lease) (get price-adjustments adjustments)),
+          total-maintenance-by-tenant: (get total-tenant-costs adjustments),
+          total-maintenance-by-landlord: (get total-landlord-costs adjustments)
+        })
+        (ok {
+          original-monthly-rent: (get monthly-rent lease),
+          original-total-price: (get total-price lease),
+          adjusted-monthly-rent: (get monthly-rent lease),
+          adjusted-total-price: (get total-price lease),
+          total-maintenance-by-tenant: u0,
+          total-maintenance-by-landlord: u0
+        })
+      )
+    ERR_LEASE_NOT_FOUND
+  )
+)
+
+(define-read-only (get-maintenance-status-summary (property-id uint))
+  (match (map-get? property-maintenance-history { property-id: property-id })
+    history (ok {
+      total-requests: (len (get maintenance-ids history)),
+      total-maintenance-cost: (get total-maintenance-cost history),
+      request-ids: (get maintenance-ids history)
+    })
+    (ok {
+      total-requests: u0,
+      total-maintenance-cost: u0,
+      request-ids: (list)
+    })
+  )
+)
+
+(define-read-only (get-next-maintenance-id)
+  (var-get next-maintenance-id)
+)
+
+
